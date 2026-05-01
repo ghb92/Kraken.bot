@@ -45,15 +45,16 @@ SEC = 'VOTRE_API_SECRET_KRAKEN'
 
 api = krakenex.API(key=KEY, secret=SEC)
 
-PAIRS        = ['XBTUSD', 'ETHUSD', 'SOLUSD']
-RISK         = 0.08    # 8% du capital par trade (réduit si SL consécutifs)
-LIMIT        = 0.10    # Circuit breaker: arrêt si -10%/jour
-COOLDOWN     = 1800    # 30 min entre trades après un SL
-TRAIL_PCT    = 0.015   # Trailing stop: 1.5% sous le plus haut atteint
-TRADE_H_MIN  = 7       # Heure de début trading (UTC)
-TRADE_H_MAX  = 23      # Heure de fin trading (UTC)
-LOG_FILE     = 'trades_log.csv'
-MAX_RETRIES  = 3       # Tentatives max sur appels API
+PAIRS            = ['XBTUSD', 'ETHUSD', 'SOLUSD']
+RISK_PER_TRADE   = 0.01    # 1% du capital RÉELLEMENT risqué par trade (perte si SL atteint)
+MAX_POSITION_PCT = 0.30    # Position max = 30% du capital (cap si SL serré → sizing énorme)
+LIMIT            = 0.10    # Circuit breaker: arrêt si -10% (réalisé + non-réalisé)
+COOLDOWN         = 1800    # 30 min entre trades après un SL
+TRAIL_PCT        = 0.015   # Trailing stop: 1.5% sous le plus haut atteint
+TRADE_H_MIN      = 7       # Heure de début trading (UTC)
+TRADE_H_MAX      = 23      # Heure de fin trading (UTC)
+LOG_FILE         = 'trades_log.csv'
+MAX_RETRIES      = 3       # Tentatives max sur appels API
 
 # État du bot
 positions   = {}   # {pair: {entry, size, sl, tp, dir, peak}}
@@ -240,10 +241,12 @@ def dashboard():
     print('\n' + '═' * 55)
     print(f'  🤖 BOT V4 KRAKEN — {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}')
     print('═' * 55)
+    total = total_pnl()
     print(f'  💰 Solde USD     : ${bal:,.2f}')
-    print(f'  📈 PnL session   : {pnl:+.2f}$')
+    print(f'  📈 PnL réalisé   : {pnl:+.2f}$')
+    print(f'  📊 PnL total     : {total:+.2f}$ (réalisé + non-réalisé)')
     print(f'  📊 Trades total  : {trade_count}')
-    print(f'  🔴 SL streak     : {sl_streak} (risque: {current_risk()*100:.0f}%)')
+    print(f'  🔴 SL streak     : {sl_streak} (risque/trade: {current_risk()*100:.2f}%)')
     print(f'  🕐 Heure UTC     : {datetime.utcnow().strftime("%H:%M")} | Trading: {"✅ OUI" if trading_hours_ok() else "❌ NON"}')
     if positions:
         print(f'  📂 Positions ouvertes ({len(positions)}):')
@@ -261,12 +264,38 @@ def dashboard():
 # ─────────────────────────────────────────────
 
 def current_risk():
-    """Retourne le risque adapté selon les SL consécutifs."""
+    """Retourne le % de capital risqué par trade, adapté selon les SL consécutifs."""
     if sl_streak >= 3:
-        return RISK * 0.5   # 4% après 3 SL de suite
+        return RISK_PER_TRADE * 0.5   # divisé par 2 après 3 SL de suite
     elif sl_streak >= 2:
-        return RISK * 0.75  # 6% après 2 SL de suite
-    return RISK             # 8% normal
+        return RISK_PER_TRADE * 0.75  # -25% après 2 SL de suite
+    return RISK_PER_TRADE
+
+def position_size(bal, price_now, sl_distance, risk):
+    """
+    Calcule la taille d'une position basée sur le risque réel.
+    - bal: capital disponible
+    - price_now: prix d'entrée
+    - sl_distance: distance prix → SL (en $, pas en %)
+    - risk: fraction du capital risquée si SL atteint
+
+    Retourne size tel que perte au SL = bal * risk, capée à MAX_POSITION_PCT du capital.
+    """
+    if sl_distance <= 0 or price_now <= 0:
+        return 0.0
+    risk_based   = (bal * risk) / sl_distance
+    notional_cap = (bal * MAX_POSITION_PCT) / price_now
+    return min(risk_based, notional_cap)
+
+def total_pnl():
+    """PnL total = réalisé + non-réalisé sur toutes les positions ouvertes."""
+    unrealized = 0.0
+    for pair_, pos in positions.items():
+        cur = price(pair_)
+        if cur is None:
+            continue
+        unrealized += (cur - pos['entry']) * pos['size'] * (1 if pos['dir'] == 'buy' else -1)
+    return pnl + unrealized
 
 # ─────────────────────────────────────────────
 # CYCLE PRINCIPAL
@@ -284,12 +313,13 @@ def cycle():
         print('  🌙 Hors plage horaire — en attente...')
         return
 
-    # Circuit breaker
+    # Circuit breaker (inclut PnL non-réalisé)
     bal = balance()
-    if pnl < 0 and abs(pnl) / max(bal, 1) > LIMIT:
-        msg = f'🔴 CIRCUIT BREAKER — Bot arrêté. PnL: {pnl:.2f}$'
-        print(f'  {msg}')
-        return
+    total = total_pnl()
+    circuit_tripped = total < 0 and abs(total) / max(bal, 1) > LIMIT
+    if circuit_tripped:
+        print(f'  🔴 CIRCUIT BREAKER — PnL total {total:+.2f}$ ({abs(total)/max(bal,1)*100:.1f}% > {LIMIT*100:.0f}%)')
+        print(f'     → blocage des nouvelles entrées (positions ouvertes toujours gérées)')
 
     for pair in PAIRS:
         try:
@@ -312,12 +342,16 @@ def cycle():
             cooldown_ok = pair not in last_sl or now - last_sl[pair] > COOLDOWN
             risk        = current_risk()
 
-            # ── Entrée ACHAT (filtre: tendance 1h pas bear)
+            # ── Entrée ACHAT (filtre: tendance 1h pas bear, circuit breaker non déclenché)
             if (sc >= 50 and trend != 'bear'
+                    and not circuit_tripped
                     and pair not in positions
                     and len(positions) < 3
                     and cooldown_ok):
-                sz = (bal * risk) / p
+                sz = position_size(bal, p, sl, risk)
+                if sz <= 0:
+                    print(f'  ⚠️  Sizing invalide pour {pair}, skip')
+                    continue
                 t  = order(pair, 'buy', sz)
                 if t:
                     positions[pair] = {
@@ -326,15 +360,19 @@ def cycle():
                         'dir': 'buy', 'peak': p
                     }
                     trade_count += 1
-                    msg = f'✅ BUY {pair} | score:{sc} | entrée:{p:.0f} | risque:{risk*100:.0f}%'
-                    print(f'  {msg}')
+                    notional = sz * p
+                    print(f'  ✅ BUY {pair} | score:{sc} | entrée:{p:.0f} | size:{sz:.6f} | notional:${notional:.0f} | risque:${bal*risk:.0f} ({risk*100:.2f}%)')
 
-            # ── Entrée VENTE (filtre: tendance 1h pas bull)
+            # ── Entrée VENTE (filtre: tendance 1h pas bull, circuit breaker non déclenché)
             elif (sc <= -50 and trend != 'bull'
+                    and not circuit_tripped
                     and pair not in positions
                     and len(positions) < 3
                     and cooldown_ok):
-                sz = (bal * risk) / p
+                sz = position_size(bal, p, sl, risk)
+                if sz <= 0:
+                    print(f'  ⚠️  Sizing invalide pour {pair}, skip')
+                    continue
                 t  = order(pair, 'sell', sz)
                 if t:
                     positions[pair] = {
@@ -343,8 +381,8 @@ def cycle():
                         'dir': 'sell', 'peak': p
                     }
                     trade_count += 1
-                    msg = f'✅ SELL {pair} | score:{sc} | entrée:{p:.0f} | risque:{risk*100:.0f}%'
-                    print(f'  {msg}')
+                    notional = sz * p
+                    print(f'  ✅ SELL {pair} | score:{sc} | entrée:{p:.0f} | size:{sz:.6f} | notional:${notional:.0f} | risque:${bal*risk:.0f} ({risk*100:.2f}%)')
 
             # ── Gestion des positions ouvertes
             elif pair in positions:
@@ -412,12 +450,13 @@ def cycle():
 
 if __name__ == '__main__':
     print('🤖 Bot V4 Kraken démarré')
-    print(f'📊 Paires       : {", ".join(PAIRS)}')
-    print(f'⚙️  Risque       : {RISK*100}% (réduit si SL consécutifs)')
-    print(f'📉 Trailing Stop: {TRAIL_PCT*100}%')
-    print(f'🕐 Trading      : {TRADE_H_MIN}h-{TRADE_H_MAX}h UTC')
-    print(f'🛡️  Circuit bkr  : -{LIMIT*100}%/jour')
-    print(f'📁 Log fichier  : {LOG_FILE}\n')
+    print(f'📊 Paires        : {", ".join(PAIRS)}')
+    print(f'⚙️  Risque/trade  : {RISK_PER_TRADE*100:.2f}% du capital (réduit si SL consécutifs)')
+    print(f'📦 Position max  : {MAX_POSITION_PCT*100:.0f}% du capital (cap notional)')
+    print(f'📉 Trailing Stop : {TRAIL_PCT*100}%')
+    print(f'🕐 Trading       : {TRADE_H_MIN}h-{TRADE_H_MAX}h UTC')
+    print(f'🛡️  Circuit bkr   : -{LIMIT*100:.0f}% (réalisé + non-réalisé)')
+    print(f'📁 Log fichier   : {LOG_FILE}\n')
 
     schedule.every(15).minutes.do(cycle)
     cycle()
