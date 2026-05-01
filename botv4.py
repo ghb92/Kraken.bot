@@ -27,14 +27,23 @@ LANCEMENT:
     python3 botv4.py
 """
 
-import krakenex
 import time
-import schedule
-import pandas as pd
-import numpy as np
 import csv
 import os
 from datetime import datetime
+import pandas as pd
+import numpy as np
+
+# Imports lazy: krakenex et schedule ne sont nécessaires qu'en mode live.
+# Le backtester importe ce module mais n'a pas besoin de ces deps.
+try:
+    import krakenex
+    import schedule
+    _LIVE_DEPS_OK = True
+except ImportError:
+    krakenex = None
+    schedule = None
+    _LIVE_DEPS_OK = False
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -43,7 +52,7 @@ from datetime import datetime
 KEY = 'VOTRE_API_KEY_KRAKEN'
 SEC = 'VOTRE_API_SECRET_KRAKEN'
 
-api = krakenex.API(key=KEY, secret=SEC)
+api = krakenex.API(key=KEY, secret=SEC) if _LIVE_DEPS_OK else None
 
 PAIRS            = ['XBTUSD', 'ETHUSD', 'SOLUSD']
 RISK_PER_TRADE   = 0.01    # 1% du capital RÉELLEMENT risqué par trade (perte si SL atteint)
@@ -127,14 +136,13 @@ def order(pair, side, size):
 # INDICATEURS TECHNIQUES (15min)
 # ─────────────────────────────────────────────
 
-def ohlcv(pair, interval=15):
-    """Récupère les bougies et calcule tous les indicateurs."""
-    r = api_call(api.query_public, 'OHLC', {'pair': pair, 'interval': interval})
-    if not r:
-        return None
-    k  = list(r['result'].keys())[0]
-    df = pd.DataFrame(r['result'][k],
-                      columns=['t', 'o', 'h', 'l', 'c', 'v', 'vw', 'n'])
+def add_indicators(df):
+    """Ajoute RSI, EMA, MACD, Bollinger, ATR à un DataFrame OHLCV.
+
+    Fonction pure (pas d'I/O) → réutilisable par le backtester.
+    Attend les colonnes: 't', 'o', 'h', 'l', 'c', 'v'.
+    """
+    df = df.copy()
     df[['c', 'h', 'l', 'v']] = df[['c', 'h', 'l', 'v']].astype(float)
 
     # RSI
@@ -168,6 +176,16 @@ def ohlcv(pair, interval=15):
     df['atr'] = tr.rolling(14).mean()
 
     return df
+
+def ohlcv(pair, interval=15):
+    """Récupère les bougies depuis Kraken et calcule les indicateurs."""
+    r = api_call(api.query_public, 'OHLC', {'pair': pair, 'interval': interval})
+    if not r:
+        return None
+    k  = list(r['result'].keys())[0]
+    df = pd.DataFrame(r['result'][k],
+                      columns=['t', 'o', 'h', 'l', 'c', 'v', 'vw', 'n'])
+    return add_indicators(df)
 
 # ─────────────────────────────────────────────
 # FILTRE TENDANCE 1H (NOUVEAU V4)
@@ -449,6 +467,10 @@ def cycle():
 # ─────────────────────────────────────────────
 
 if __name__ == '__main__':
+    if not _LIVE_DEPS_OK:
+        print('❌ Modules krakenex et/ou schedule manquants.')
+        print('   Installation: pip install krakenex schedule')
+        raise SystemExit(1)
     print('🤖 Bot V4 Kraken démarré')
     print(f'📊 Paires        : {", ".join(PAIRS)}')
     print(f'⚙️  Risque/trade  : {RISK_PER_TRADE*100:.2f}% du capital (réduit si SL consécutifs)')
